@@ -75,13 +75,14 @@ dashboard_placeholder = st.empty()
 # =========================
 cap = None
 webcam_allowed = True
+uploaded_temp_file = None
 
 if source == "Upload Video":
     uploaded_video = st.file_uploader("Upload CCTV / Crowd Video", type=["mp4", "avi"])
     if uploaded_video:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(uploaded_video.read())
-        cap = cv2.VideoCapture(temp.name)
+        uploaded_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        uploaded_temp_file.write(uploaded_video.read())
+        cap = cv2.VideoCapture(uploaded_temp_file.name)
 else:
     if IS_CLOUD:
         webcam_allowed = False
@@ -116,6 +117,12 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
     low_risk_frames = 0
     risk_confidences = []
     start_time = time.time()
+
+    # Temp file to store processed video for Streamlit cloud
+    processed_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(processed_video_path, fourcc, 20.0,
+                          (prev_frame.shape[1], prev_frame.shape[0]))
 
     # =========================
     # MAIN LOOP
@@ -220,23 +227,15 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
         cv2.putText(frame, f"Spike: {'YES' if spike_detected else 'NO'}", (20, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        video_box.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        # ---------- Dashboard ----------
-        with dashboard_placeholder.container():
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Frames", frame_count, help="Number of frames processed")
-            c2.metric("Motion", f"{smooth_motion:.2f}", help="Average crowd movement magnitude")
-            c3.metric("Spikes", spike_count, help="Number of sudden crowd rushes detected")
-            c4.metric("Alerts", alerts_count, help="High/critical risk frames logged")
-            c5.metric("Confidence", f"{np.mean(risk_confidences):.2f}", help="System confidence in detected risk")
-            c6.metric("Active Zone", active_zone, help="Zone with most crowd activity currently")
+        # ---------- Write frame to output video ----------
+        out.write(frame)
 
         prev_gray = gray
         prev_motion = smooth_motion
         frame_count += 1
 
     cap.release()
+    out.release()
     fps = frame_count / (time.time() - start_time)
     avg_confidence = np.mean(risk_confidences) if risk_confidences else 0.0
 
@@ -246,29 +245,36 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
     )
 
     # =========================
-    # FINAL BEGINNER-FRIENDLY SUMMARY
+    # PLAY PROCESSED VIDEO
+    # =========================
+    st.subheader("📹 Processed Crowd Video")
+    st.video(processed_video_path)
+
+    # =========================
+    # FINAL BEGINNER-FRIENDLY SUMMARY WITH MORE EXPLANATION
     # =========================
     st.success(f"""
 ## ✅ Final Crowd Safety Report
 
 ### ❓ What happened?
 The system watched **crowd movement over time** and detected:
-• Fast movements  
-• Sudden spikes (panic / congestion)  
-• Most active zones  
+• Fast movements → Measures how quickly the crowd is moving  
+• Sudden spikes → Sudden rushes or panics detected via abrupt motion changes  
+• Most active zones → Areas with highest crowd activity
 
 ### 📝 Alerts Explanation
-- **VERY LOW / NORMAL:** Safe, calm crowd  
-- **ELEVATED:** Watch crowd density  
-- **HIGH RISK:** Fast moving crowd, staff needed  
-- **CRITICAL:** Dangerous crowd, immediate action required  
+- **VERY LOW / NORMAL:** Crowd is calm, no risk  
+- **ELEVATED:** Crowd is getting denser, monitor closely  
+- **HIGH RISK:** Fast moving or dense crowd, preventive actions needed  
+- **CRITICAL:** Unsafe, immediate actions like opening exits or alerting authorities
 
-### 🚨 Alerts Summary
-• Total Alerts (High / Critical): **{alerts_count}**  
-• Sudden Movements / Spikes: **{spike_count}**  
-• Calm / Low-Risk Frames: **{low_risk_frames}**  
-• Average Confidence: **{avg_confidence:.2f}**  
-• Interpretation: Confidence close to 1 = system highly sure about risk
+### 🚨 Metrics Explained
+- **Frames:** Number of video frames processed (higher = longer video analyzed)  
+- **Motion:** Average crowd movement magnitude, higher means faster movement  
+- **Spikes:** Number of sudden rushes detected (possible panic)  
+- **Alerts:** High / critical risk frames logged  
+- **Confidence:** System confidence (0–1) in risk estimation  
+- **Active Zone:** The zone currently most crowded
 
 ### 🧭 Recommended Actions
 1️⃣ Slow / stop entry if alerts are HIGH or CRITICAL  
@@ -278,11 +284,11 @@ The system watched **crowd movement over time** and detected:
 ### 📁 Logs
 • File: **{LOG_FILE}**  
 • Contains timestamp, risk, active zone, motion, spike, confidence, action, explanation  
-• Can be used for audit or review
+• Useful for audits or post-event analysis
 
 ### ⚙️ System Health
 • Processing speed: **{fps:.2f} FPS**  
-• Dashboard is visual only; **trust logs first**
+• Video display is now playable on Streamlit cloud
 """)
 
 # =========================
@@ -291,11 +297,9 @@ The system watched **crowd movement over time** and detected:
 st.markdown("---")
 st.subheader("📄 System Logs")
 if os.path.exists(LOG_FILE):
-    # Safe log read to avoid Unicode errors
     with open(LOG_FILE, "r", errors="replace") as f:
         log_text = f.read()
     st.text_area("Log Output (Read-Only)", log_text, height=250)
     st.download_button("⬇️ Download Logs", log_text, file_name="crowd_alerts.log")
 else:
     st.info("No logs generated yet.")
-
