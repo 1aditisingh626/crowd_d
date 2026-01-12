@@ -291,9 +291,11 @@ The system watched **crowd movement over time** and detected:
 st.markdown("---")
 st.subheader("📄 System Logs")
 if os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "r") as f:
+    # Safe log read to avoid Unicode errors
+    with open(LOG_FILE, "r", errors="replace") as f:
         log_text = f.read()
     st.text_area("Log Output (Read-Only)", log_text, height=250)
     st.download_button("⬇️ Download Logs", log_text, file_name="crowd_alerts.log")
 else:
     st.info("No logs generated yet.")
+
