@@ -16,6 +16,7 @@ IS_CLOUD = os.environ.get("STREAMLIT_CLOUD") == "true"
 # LOGGING SETUP
 # =========================
 LOG_FILE = "crowd_alerts.log"
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -23,6 +24,7 @@ logging.basicConfig(
 )
 
 def log_and_print(message, level="INFO"):
+    """Logs to file AND prints to console"""
     if level == "WARNING":
         logging.warning(message)
     else:
@@ -59,26 +61,34 @@ This system detects **unsafe crowd movement**, not people.
 # =========================
 # INPUT SOURCE
 # =========================
-source = st.radio("📥 Select Input Source", ["Upload Video", "Use Webcam (Local Only)"])
+source = st.radio(
+    "📥 Select Input Source",
+    ["Upload Video", "Use Webcam (Local Only)"]
+)
+
 video_box = st.empty()
 alert_box = st.empty()
 dashboard_placeholder = st.empty()
 
+# =========================
+# VIDEO CAPTURE
+# =========================
 cap = None
 webcam_allowed = True
-uploaded_temp_file = None
 
 if source == "Upload Video":
     uploaded_video = st.file_uploader("Upload CCTV / Crowd Video", type=["mp4", "avi"])
     if uploaded_video:
-        uploaded_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        uploaded_temp_file.write(uploaded_video.read())
-        uploaded_temp_file.close()
-        cap = cv2.VideoCapture(uploaded_temp_file.name)
+        temp = tempfile.NamedTemporaryFile(delete=False)
+        temp.write(uploaded_video.read())
+        cap = cv2.VideoCapture(temp.name)
 else:
     if IS_CLOUD:
         webcam_allowed = False
-        st.warning("🚫 Webcam disabled on Streamlit Cloud. Upload a video instead.")
+        st.warning("""
+🚫 **Webcam Disabled on Streamlit Cloud**  
+Use a video upload for demo or run locally for live camera.
+""")
     else:
         cap = cv2.VideoCapture(0)
 
@@ -86,14 +96,18 @@ else:
 # START DETECTION
 # =========================
 if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
+
     ret, prev_frame = cap.read()
     if not ret:
         st.error("❌ Unable to read video source")
         st.stop()
 
     log_and_print("SYSTEM STARTED | Crowd analysis running")
+
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     prev_motion = 0.0
+
+    # Rolling average buffer to smooth sudden spikes
     motion_buffer = []
 
     frame_count = 0
@@ -104,7 +118,7 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
     start_time = time.time()
 
     # =========================
-    # LIVE VIDEO LOOP
+    # MAIN LOOP
     # =========================
     while True:
         ret, frame = cap.read()
@@ -113,26 +127,29 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Optical flow
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                            0.5, 3, 15, 3, 5, 1.2, 0)
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, gray, None,
+            0.5, 3, 15, 3, 5, 1.2, 0
+        )
+
         mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
         avg_motion = float(np.mean(mag))
 
-        # Smooth motion
+        # ---------- Smooth motion ----------
         motion_buffer.append(avg_motion)
         if len(motion_buffer) > 5:
             motion_buffer.pop(0)
         smooth_motion = np.mean(motion_buffer)
 
-        # Spike detection
+        # ---------- Spike Detection ----------
         spike = smooth_motion - prev_motion
         spike_detected = spike > SPIKE_THRESHOLD
+        spike_explanation = "No sudden spike." if not spike_detected else "Sudden rush detected! High risk of panic or stampede."
+
         if spike_detected:
             spike_count += 1
-        spike_explanation = "Sudden rush!" if spike_detected else "No spike."
 
-        # Zone analysis
+        # ---------- Zone Analysis ----------
         h, w = gray.shape
         zones = {
             "Zone 1 (Top-Left)": np.mean(mag[:h//2, :w//2]),
@@ -142,44 +159,60 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
         }
         active_zone = max(zones, key=zones.get)
 
-        # Risk classification
+        # ---------- Risk Classification ----------
         if smooth_motion < VERY_LOW:
-            risk, confidence, explanation = "VERY LOW", 0.95, "Crowd is calm."
+            risk = "VERY LOW"
+            confidence = 0.95
+            explanation = "Crowd is calm, safe movement."
         elif smooth_motion < NORMAL:
-            risk, confidence, explanation = "NORMAL", 0.85, "Crowd moving normally."
+            risk = "NORMAL"
+            confidence = 0.85
+            explanation = "Crowd is moving normally."
         elif smooth_motion < ELEVATED:
-            risk, confidence, explanation = "ELEVATED", 0.70, "Crowd getting dense."
+            risk = "ELEVATED"
+            confidence = 0.70
+            explanation = "Crowd is getting dense, monitor carefully."
         elif smooth_motion < HIGH:
-            risk, confidence, explanation = "HIGH RISK", 0.60, "Fast moving crowd."
+            risk = "HIGH RISK"
+            confidence = 0.60
+            explanation = "Crowd is moving fast, prepare staff."
         else:
-            risk, confidence, explanation = "CRITICAL", 0.90, "Dangerous movement!"
+            risk = "CRITICAL"
+            confidence = 0.90
+            explanation = "Crowd movement is dangerous, act immediately!"
 
         if spike_detected:
-            risk, confidence, explanation = "CRITICAL", 0.99, "Sudden rush detected!"
+            risk = "CRITICAL"
+            confidence = 0.99
+            explanation = "Sudden rush detected! High risk of panic or stampede."
 
         risk_confidences.append(confidence)
 
-        # Action based on risk
+        # ---------- Action ----------
         if risk == "CRITICAL":
-            action = "IMMEDIATE ACTION: Open exits, alert authorities"
+            action = "IMMEDIATE ACTION: Open exits, stop inflow, alert authorities"
         elif risk == "HIGH RISK":
-            action = "PREVENTIVE ACTION: Deploy staff"
+            action = "PREVENTIVE ACTION: Control entry, deploy staff"
         elif risk == "ELEVATED":
             action = "MONITOR: Crowd density rising"
         else:
             action = "SAFE"
 
-        # Logging
-        log_message = f"{datetime.now()} | {risk} | {active_zone} | Motion={smooth_motion:.2f} | Spike={'YES' if spike_detected else 'NO'} | Confidence={confidence:.2f} | {action} | {explanation}"
+        # ---------- Logging ----------
+        log_message = (
+            f"{datetime.now()} | {risk} | {active_zone} | "
+            f"Motion={smooth_motion:.2f} | Spike={'YES' if spike_detected else 'NO'} | "
+            f"Confidence={confidence:.2f} | {action} | Explanation: {explanation} | Spike Info: {spike_explanation}"
+        )
         if risk in ["HIGH RISK", "CRITICAL"]:
             alerts_count += 1
             log_and_print(log_message, "WARNING")
             alert_box.warning(log_message)
         else:
             low_risk_frames += 1
-            log_and_print(log_message)
+            log_and_print(log_message, "INFO")
 
-        # Overlay text
+        # ---------- Overlay ----------
         cv2.putText(frame, f"Risk: {risk} ({confidence:.2f})", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
         cv2.putText(frame, f"Active Zone: {active_zone}", (20, 80),
@@ -187,27 +220,81 @@ if st.button("▶ Start Detection") and cap is not None and webcam_allowed:
         cv2.putText(frame, f"Spike: {'YES' if spike_detected else 'NO'}", (20, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # Show frame live in Streamlit
         video_box.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # Update dashboard
+        # ---------- Dashboard ----------
         with dashboard_placeholder.container():
             c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Frames", frame_count)
-            c2.metric("Motion", f"{smooth_motion:.2f}")
-            c3.metric("Spikes", spike_count)
-            c4.metric("Alerts", alerts_count)
-            c5.metric("Confidence", f"{np.mean(risk_confidences):.2f}")
-            c6.metric("Active Zone", active_zone)
+            c1.metric("Frames", frame_count, help="Number of frames processed")
+            c2.metric("Motion", f"{smooth_motion:.2f}", help="Average crowd movement magnitude")
+            c3.metric("Spikes", spike_count, help="Number of sudden crowd rushes detected")
+            c4.metric("Alerts", alerts_count, help="High/critical risk frames logged")
+            c5.metric("Confidence", f"{np.mean(risk_confidences):.2f}", help="System confidence in detected risk")
+            c6.metric("Active Zone", active_zone, help="Zone with most crowd activity currently")
 
         prev_gray = gray
         prev_motion = smooth_motion
         frame_count += 1
-        time.sleep(0.03)  # simulate ~30 FPS live playback
 
     cap.release()
     fps = frame_count / (time.time() - start_time)
+    avg_confidence = np.mean(risk_confidences) if risk_confidences else 0.0
 
-    st.success(f"✅ Finished! Processed {frame_count} frames at {fps:.2f} FPS.")
-    st.markdown(f"**Total Alerts:** {alerts_count}, **Spikes:** {spike_count}, **Avg Confidence:** {np.mean(risk_confidences):.2f}")
+    log_and_print(
+        f"SYSTEM STOPPED | Frames={frame_count} | Alerts={alerts_count} | "
+        f"LowRiskFrames={low_risk_frames} | AvgConfidence={avg_confidence:.2f} | FPS={fps:.2f}"
+    )
 
+    # =========================
+    # FINAL BEGINNER-FRIENDLY SUMMARY
+    # =========================
+    st.success(f"""
+## ✅ Final Crowd Safety Report
+
+### ❓ What happened?
+The system watched **crowd movement over time** and detected:
+• Fast movements  
+• Sudden spikes (panic / congestion)  
+• Most active zones  
+
+### 📝 Alerts Explanation
+- **VERY LOW / NORMAL:** Safe, calm crowd  
+- **ELEVATED:** Watch crowd density  
+- **HIGH RISK:** Fast moving crowd, staff needed  
+- **CRITICAL:** Dangerous crowd, immediate action required  
+
+### 🚨 Alerts Summary
+• Total Alerts (High / Critical): **{alerts_count}**  
+• Sudden Movements / Spikes: **{spike_count}**  
+• Calm / Low-Risk Frames: **{low_risk_frames}**  
+• Average Confidence: **{avg_confidence:.2f}**  
+• Interpretation: Confidence close to 1 = system highly sure about risk
+
+### 🧭 Recommended Actions
+1️⃣ Slow / stop entry if alerts are HIGH or CRITICAL  
+2️⃣ Open exits and send staff to active zone  
+3️⃣ Always follow instructions in **logs**
+
+### 📁 Logs
+• File: **{LOG_FILE}**  
+• Contains timestamp, risk, active zone, motion, spike, confidence, action, explanation  
+• Can be used for audit or review
+
+### ⚙️ System Health
+• Processing speed: **{fps:.2f} FPS**  
+• Dashboard is visual only; **trust logs first**
+""")
+
+# =========================
+# LOG VIEWER
+# =========================
+st.markdown("---")
+st.subheader("📄 System Logs")
+if os.path.exists(LOG_FILE):
+    # Safe log read to avoid Unicode errors
+    with open(LOG_FILE, "r", errors="replace") as f:
+        log_text = f.read()
+    st.text_area("Log Output (Read-Only)", log_text, height=250)
+    st.download_button("⬇️ Download Logs", log_text, file_name="crowd_alerts.log")
+else:
+    st.info("No logs generated yet.")
