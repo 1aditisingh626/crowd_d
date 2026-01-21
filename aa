@@ -1,0 +1,390 @@
+import streamlit as st
+import cv2
+import numpy as np
+import tempfile
+import time
+import logging
+import os
+import matplotlib.pyplot as plt
+from collections import Counter
+
+# =========================
+# ENVIRONMENT
+# =========================
+IS_CLOUD = os.environ.get("STREAMLIT_CLOUD") == "true"
+
+# =========================
+# LOGGING
+# =========================
+LOG_FILE = "crowd_alerts.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+def log_and_print(msg, level="INFO"):
+    """Enhanced logging: also prints time-stamped output to console."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    line = f"[{timestamp}] | {level} | {msg}"
+    if level == "WARNING":
+        logging.warning(msg)
+    else:
+        logging.info(msg)
+    print(line)
+
+def print_console_chart(values, label="Motion", width=30):
+    """Simple ASCII bar chart for console visualization."""
+    # Replace NaN with 0
+    values = [0 if np.isnan(v) else v for v in values]
+    max_val = max(values) if values and max(values) != 0 else 1  # avoid division by zero
+    scaled = [min(int(v / max_val * width), width) for v in values]  # clip to width
+    bar_str = "".join(["|"*s + " "*(width-s) + "\n" for s in scaled])
+    print(f" {label} Trend (last {len(values)} frames):\n{bar_str}")
+
+# =========================
+# SYSTEM SETTINGS
+# =========================
+FRAME_SKIP = 2
+BUFFER_SIZE = 7
+CALIBRATION_FRAMES = 50
+EMERGENCY_ALERT_THRESHOLD = 3
+STAMPEDE_PREDICTION_WINDOW = 8
+CHART_WINDOW = 20  # Last N frames for console chart
+
+#1 risk  reasoning helpers
+def clamp(x,lo=0,hi=1):
+    return max(lo,min(x,hi))
+
+
+def normalize(value,low,high):
+    if high - low ==0:
+        return 0
+    return clamp((value-low)/(high-low))
+
+#SIREN_URL = "https://cdn.pixabay.com/download/audio/2022/03/15/audio_8c8a7b2c9a.mp3"
+
+
+# =========================
+# STREAMLIT UI
+# =========================
+st.set_page_config("Crowd Risk Detection", layout="wide")
+st.title("Crowd Behavior Risk Detection System")
+st.markdown("""
+###  User-Friendly System
+This system studies **crowd-level motion patterns** to:
+- Detect panic
+- Identify unsafe collective movement
+- Predict stampedes early
+- Trigger emergency actions
+""")
+
+# =========================
+# INPUT
+# =========================
+source = st.radio("Select Input Source", ["Upload Video", "Webcam (Local)"])
+video_box = st.empty()
+emergency_box = st.empty()
+cap = None
+if source == "Upload Video":
+    uploaded = st.file_uploader("Upload crowd video", type=["mp4", "avi"])
+    if uploaded:
+        temp = tempfile.NamedTemporaryFile(delete=False)
+        temp.write(uploaded.read())
+        cap = cv2.VideoCapture(temp.name)
+else:
+    if IS_CLOUD:
+        st.warning("Webcam not available on cloud")
+    else:
+        cap = cv2.VideoCapture(0)
+
+# =========================
+# DASHBOARD
+# =========================
+st.markdown("##  Live Crowd Chart")
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+m_frames = c1.metric("Frames", 0)
+m_motion = c2.metric("Avg Motion", "0.00")
+m_zones  = c3.metric("Risky Zones", "0/3")
+m_spikes = c4.metric("Panic Spikes", 0)
+m_alerts = c5.metric("High Alerts", 0)
+m_predict = c6.metric("Stampede Risk", "LOW")
+final_summary_box = st.empty()
+final_interpret_box = st.empty()
+final_recommend_box = st.empty()
+final_conclusion_box = st.empty()
+risk_chart_box = st.empty()
+
+# =========================
+# START
+# =========================
+if st.button(" Start Detection") and cap:
+
+    # --- Initialize variables ONCE ---
+    motion_buffer = []
+    baseline_motion = []
+    motion_history = []
+    confidence_history = []
+    risk_labels = []
+
+   #1 risk
+    risk_window = []
+    prev_density = 0
+
+
+    processed_frames = 0
+    spike_count = 0
+    alerts_count = 0
+    critical_count = 0
+    thresholds_ready = False
+    start_time = time.time()
+
+    # --- Background Subtractor for density ---
+    fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+
+    log_and_print("\n========== SYSTEM STARTED ==========")
+    log_and_print("Calibrating normal crowd behavior...")
+
+    # --- Read the first frame to initialize prev_gray ---
+    ret, frame = cap.read()
+    if not ret:
+        log_and_print(" No frames found. Exiting.")
+        st.stop()
+
+    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # initialize prev_gray
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            log_and_print("No more frames detected. Ending video stream.")
+            break
+
+        processed_frames += 1
+        if processed_frames % FRAME_SKIP != 0:
+            continue
+
+        # --- Convert to grayscale ---
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # --- Density Estimation ---
+        fgmask = fgbg.apply(frame)
+        density_percent = (np.sum(fgmask > 0) / (fgmask.shape[0] * fgmask.shape[1])) * 100
+        if density_percent > 80:
+            log_and_print(f" High crowd density detected: {density_percent:.2f}% foreground", "WARNING")
+
+        # --- Motion & Risk Detection ---
+        h, w = gray.shape
+        zones = [(0, w//3), (w//3, 2*w//3), (2*w//3, w)]
+        zone_motions = []
+
+        # Optical flow calculation
+        for idx, (x1, x2) in enumerate(zones):
+            flow = cv2.calcOpticalFlowFarneback(prev_gray[:, x1:x2], gray[:, x1:x2],
+                                                None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
+            zone_motions.append(np.mean(mag))
+
+        avg_motion = np.mean(zone_motions)
+        motion_buffer.append(avg_motion)
+        if len(motion_buffer) > BUFFER_SIZE: motion_buffer.pop(0)
+        smooth_motion = np.mean(motion_buffer)
+
+        # --- Calibration ---
+        if not thresholds_ready:
+            baseline_motion.append(smooth_motion)
+            log_and_print(f"Calibration {len(baseline_motion)}/{CALIBRATION_FRAMES} | motion={smooth_motion:.5f}")
+
+            if len(baseline_motion) >= CALIBRATION_FRAMES:
+                base = np.array(baseline_motion)
+                mean = base.mean()
+                std = base.std()
+                median = np.median(base)
+                mad = np.median(np.abs(base - median))
+                min_val, max_val = base.min(), base.max()
+
+                # Dynamic thresholds
+                VERY_LOW = median - 1.0 * mad
+                NORMAL = median
+                ELEVATED = median + 1.5 * mad
+                HIGH = median + 2.5 * mad
+                CRITICAL = median + 3.5 * mad
+                SPIKE_THRESHOLD = 2.2 * std
+
+                thresholds_ready = True
+                log_and_print(f" Calibration complete!")
+                log_and_print(
+                    f"Mean={mean:.5f}, Std={std:.5f}, Median={median:.5f}, MAD={mad:.5f}, Min={min_val:.5f}, Max={max_val:.5f}")
+                log_and_print(
+                    f"Thresholds | VERY_LOW={VERY_LOW:.5f}, NORMAL={NORMAL:.5f}, ELEVATED={ELEVATED:.5f}, HIGH={HIGH:.5f}, CRITICAL={CRITICAL:.5f}, SPIKE={SPIKE_THRESHOLD:.5f}")
+
+            prev_gray = gray
+            continue
+
+        # --- Risk & Spike Detection ---
+        spike_up = (smooth_motion - mean) > SPIKE_THRESHOLD
+        spike_down = (mean - smooth_motion) > SPIKE_THRESHOLD / 2
+        spike = spike_up or spike_down
+
+        if smooth_motion < VERY_LOW:
+            risk, conf = "VERY LOW", 0.98
+        elif smooth_motion < NORMAL:
+            risk, conf = "LOW", 0.92
+        elif smooth_motion < ELEVATED:
+            risk, conf = "MODERATE", 0.82
+        elif smooth_motion < HIGH:
+            risk, conf = "ELEVATED", 0.72
+        elif smooth_motion < CRITICAL:
+            risk, conf = "HIGH RISK", 0.62
+        else:
+            risk, conf = "CRITICAL", 0.95
+
+        if spike:
+            spike_count += 1
+            risk, conf = "CRITICAL", 0.99
+            direction = "↑" if spike_up else "↓"
+            log_and_print(
+                f"⚠ Panic spike {direction} detected at frame {processed_frames} | motion={smooth_motion:.5f}",
+                "WARNING")
+
+        risky_zones = sum(z > ELEVATED for z in zone_motions)
+        if risk in ["HIGH RISK", "CRITICAL"]: alerts_count += 1
+        if risk == "CRITICAL": critical_count += 1
+
+        motion_history.append(smooth_motion)
+        confidence_history.append(conf)
+        risk_labels.append(risk)
+
+        # --- Stampede Prediction ---
+        stampede_prediction = "LOW"
+        slope = 0
+        if len(motion_history) >= STAMPEDE_PREDICTION_WINDOW:
+            recent = motion_history[-STAMPEDE_PREDICTION_WINDOW:]
+            slope = np.polyfit(range(len(recent)), recent, 1)[0]
+            if slope > 0.05 and risky_zones >= 2:
+                stampede_prediction = "HIGH"
+                log_and_print(f" Frame {processed_frames} | Stampede trend detected! slope={slope:.5f}", "WARNING")
+
+        # --- Emergency & Persistence Checks ---
+        CRITICAL_PERSISTENCE = 3
+        if 'critical_buffer' not in globals():
+            critical_buffer = 0
+        if risk == "CRITICAL":
+            critical_buffer += 1
+        else:
+            critical_buffer = 0
+        if critical_buffer >= CRITICAL_PERSISTENCE:
+            emergency_box.error(f"""
+          **EMERGENCY MODE ACTIVATED** (Persistence Check)
+        • CRITICAL frames in a row: {critical_buffer}  
+        • Panic spreading across zones: {risky_zones}/3  
+        • Stampede risk: {stampede_prediction}  
+        • Immediate intervention required! 
+        """)
+            log_and_print(f" EMERGENCY MODE ACTIVATED with persistence at frame {processed_frames}", "WARNING")
+
+        # --- Console & Dashboard Updates ---
+        log_and_print(
+            f"Frame {processed_frames} | Avg motion: {smooth_motion:.5f} | Risk: {risk} | Conf: {conf:.2f} | Spikes: {spike_count} | Risky zones: {risky_zones}/3 | Stampede risk: {stampede_prediction}")
+        for idx, zm in enumerate(zone_motions):
+            log_and_print(f"    Zone {idx + 1} motion: {zm:.5f}")
+
+        interpretation = f"""
+        Frame {processed_frames} Interpretation:
+        - Crowd is currently in '{risk}' state with confidence {conf:.2f}.
+        - {risky_zones}/3 zones are above ELEVATED motion threshold.
+        - Motion trend slope: {slope:.5f} → {'Rising' if slope > 0 else 'Stable/Declining'} crowd acceleration.
+        - Total spikes detected so far: {spike_count}.
+        - Stampede prediction: {stampede_prediction}.
+        """
+        log_and_print(interpretation)
+
+        recommendations = f"""
+        Frame {processed_frames} Recommendations:
+        - {'Immediate crowd control needed!' if risk in ['HIGH RISK', 'CRITICAL'] else 'Monitor crowd closely.'}
+        - {'Deploy marshals to risky zones.' if risky_zones >= 2 else 'Maintain regular supervision.'}
+        - {'Activate emergency protocols.' if critical_count >= EMERGENCY_ALERT_THRESHOLD else ''}
+        - {'Inform public and guide crowd.' if spike else ''}
+        - {'Check exits and entry points for congestion.' if slope > 0.05 else ''}"""
+        log_and_print(recommendations)
+
+        m_frames.metric("Frames", processed_frames)
+        m_motion.metric("Avg Motion", f"{smooth_motion:.2f}")
+        m_zones.metric("Risky Zones", f"{risky_zones}/3")
+        m_spikes.metric("Panic Spikes", spike_count)
+        m_alerts.metric("High Alerts", alerts_count)
+        m_predict.metric("Stampede Risk", stampede_prediction)
+
+        cv2.putText(frame, f"Risk: {risk}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+        cv2.putText(frame, f"Stampede: {stampede_prediction}", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+        video_box.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        prev_gray = gray
+
+        if len(motion_history) >= CHART_WINDOW:
+            print_console_chart(motion_history[-CHART_WINDOW:], label="Motion")
+            print_console_chart([sum(z> ELEVATED for z in zone_motions) for _ in range(CHART_WINDOW)],
+                                label="Risky Zones")
+            print(f"Frame {processed_frames} | Risk: {risk} | Stampede: {stampede_prediction} | Zones risky: {risky_zones}/3 | Panic spikes: {spike_count}\n")
+
+
+        def risk_to_score(risk, spike=False):
+            if spike:
+                return 100
+            mapping = {
+                "VERY LOW": 10,
+                "LOW": 25,
+                "MODERATE": 45,
+                "ELEVATED": 65,
+                "HIGH RISK": 85,
+                "CRITICAL": 100
+            }
+            return mapping.get(risk, 0)
+
+
+       # emergency_box.audio(SIREN_URL, autoplay=True)
+
+    # --- Final Summary ---
+    cap.release()
+    fps = processed_frames / (time.time() - start_time)
+    avg_conf = np.mean(confidence_history)
+    danger_frames = sum(r in ["HIGH RISK", "CRITICAL"] for r in risk_labels)
+    danger_pct = (danger_frames / len(risk_labels)) * 100
+    stability_score = max(0, 100 - danger_pct)
+
+    log_and_print("\n========== FINAL SYSTEM REPORT ==========")
+    log_and_print(f"Total frames processed          : {processed_frames}")
+    log_and_print(f"Processing FPS                  : {fps:.2f}")
+    log_and_print(f"Average motion confidence       : {avg_conf:.2f}")
+    log_and_print(f"Frames with HIGH/CRITICAL risk  : {danger_frames} ({danger_pct:.2f}%)")
+    log_and_print(f"Total panic spikes detected     : {spike_count}")
+    log_and_print(f"Total critical events           : {critical_count}")
+    log_and_print(f"Crowd stability score           : {stability_score:.2f}/100")
+    log_and_print("Risk level Mapping over frames   :")
+    risk_counter = Counter(risk_labels)
+    for k,v in risk_counter.items():
+        log_and_print(f"  {k:<10} : {v} frames ({(v/processed_frames)*100:.2f}%)")
+    verdict = "🟢 SAFE CROWD - low movement / Normal walking" if danger_pct<10 else "🟠 UNSTABLE – INTERVENTION ADVISED - Rising motion → accelerating crowd " if danger_pct<30 else "🔴 STAMPEDE HIGHLY LIKELY  - Control entry & exit points / Reduce inflow immediately/  Deploy crowd marshals  /Spikes → panic or sudden rush"
+    log_and_print(f"FINAL VERDICT: {verdict}")
+
+    final_summary_box.markdown(f"""
+## 🧾 Final Analysis Summary
+- **Frames analyzed:** {processed_frames}  
+- **System speed:** {fps:.2f} FPS  
+- **Average confidence:** {avg_conf:.2f}  
+- **Dangerous crowd time:** {danger_pct:.2f}%  
+- **Crowd stability score:** {stability_score:.1f}/100  
+""")
+
+    final_conclusion_box.success(f"### 🚦 FINAL VERDICT\n{verdict}")
+
+    fig = plt.figure(figsize = (2,1.5))
+    plt.plot(motion_history)
+    plt.title("Crowd Motion Over Time",fontsize = 5)
+    plt.xlabel("Time",fontsize = 5)
+    plt.ylabel("Motion Intensity",fontsize = 5)
+    risk_chart_box.pyplot(fig)
+
+    log_and_print("========== SYSTEM STOPPED ==========\n")
+
+
